@@ -825,6 +825,25 @@ func refresh(want, all []file) {
 	// Limit cold-scan workers to the windows that can survive publication.
 	// Otherwise a batch of historical files could retain every window until
 	// the whole scan finishes.
+	// One job per path: todo can carry the same path twice (allFiles appends
+	// the files of every agent it knows, so one file can be had by two of
+	// them), and two jobs on one path would leave the second replacing the
+	// first's channel in parsing while both are published — the panic that
+	// took the app down on every start (#2932, #3255). It is dropped here, before
+	// the windows, the sort and the byte total below, which all count todo
+	// and would otherwise read one file twice over.
+	if len(todo) > 1 {
+		uniq := make([]file, 0, len(todo))
+		seen := make(map[string]bool, len(todo))
+		for _, f := range todo {
+			if seen[f.path] {
+				continue
+			}
+			seen[f.path] = true
+			uniq = append(uniq, f)
+		}
+		todo = uniq
+	}
 	windows := summaryRevisionWindows(todo, time.Now())
 	// the biggest first, so no long file is left to run on alone at the
 	// end; and twice the cores, as the reading waits on the disk
@@ -840,11 +859,19 @@ func refresh(want, all []file) {
 		f      file
 		old    *state
 		parsed *state
+		// ready is the channel this job made for parsing[f.path]. It is
+		// kept here rather than read back from parsing at publish: a
+		// concurrent refresh, or a repeated path in todo, may have
+		// replaced or deleted the map entry since, and closing what the
+		// map says then is a close of nil or of another's channel
+		// (which took the app down on every start, #2932, #3255).
+		ready chan struct{}
 	}
 	jobs := make([]job, len(todo))
 	for i, f := range todo {
-		jobs[i] = job{f: f, old: cache[f.path]}
-		parsing[f.path] = make(chan struct{})
+		ready := make(chan struct{})
+		jobs[i] = job{f: f, old: cache[f.path], ready: ready}
+		parsing[f.path] = ready
 	}
 	generation := cacheGeneration
 	mu.Unlock()
@@ -882,14 +909,22 @@ func refresh(want, all []file) {
 	}()
 	// publish puts a finished parse in the cache at once, for a reader
 	// waiting on it, and lets the file be read again.
+	// It closes only the channel this job made, and only deletes the map
+	// entry while that is still the one there: the entry may belong to a
+	// refresh that started after this one, and a repeated path in todo
+	// may have replaced this job's own with a later one. Closing the map's
+	// channel instead of this job's took the app down on every start.
+	// (#2932, #3255)
 	publish := func(i int) {
 		j := &jobs[i]
 		// A concurrent read may already have published a newer parse.
 		if generation == cacheGeneration && cache[j.f.path] == j.old {
 			cache[j.f.path] = j.parsed
 		}
-		close(parsing[j.f.path])
-		delete(parsing, j.f.path)
+		if parsing[j.f.path] == j.ready {
+			delete(parsing, j.f.path)
+		}
+		close(j.ready)
 	}
 	// What is read is kept on disk every checkpointEvery, not only at the
 	// end: a first read of a long history on a slow disk runs for minutes,
